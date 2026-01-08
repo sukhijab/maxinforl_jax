@@ -87,6 +87,7 @@ class DeterministicEnsemble(object):
                  agg_info_gain: str = 'mean',
                  normalize_data: bool = True,
                  normalize_info_gain: bool = True,
+                 use_entropy_for_int_rew: bool = True,
                  activations: Callable[[jnp.ndarray], jnp.ndarray] = nn.silu
                  ):
         self.num_heads = num_heads
@@ -96,7 +97,10 @@ class DeterministicEnsemble(object):
         self.learn_std = False
         self.normalize_data = normalize_data
         self.normalize_info_gain = normalize_info_gain
+        self.use_entropy_for_int_rew = use_entropy_for_int_rew
         self.normalizer = Normalizer()
+        out_size = model_kwargs['hidden_dims'][-1]
+        self._disg_weights = jnp.ones(out_size)
 
     def init(self, key: jax.random.PRNGKey, input: jnp.ndarray):
         key = jax.random.split(key, self.num_heads)
@@ -126,6 +130,7 @@ class DeterministicEnsemble(object):
             output_normalizer_state=output_normalizer_state,
             info_gain_normalizer_state=info_gain_normalizer_state,
         )
+        self._disg_weights = jnp.ones(out_size)
 
         opt_state = self.tx.init(vmapped_params)
         return EnsembleState(
@@ -134,6 +139,10 @@ class DeterministicEnsemble(object):
             step=0,
             ensemble_normalizer_state=ensemble_normalizer_state,
         )
+
+    def set_disg_weights(self, disg_weights: jnp.ndarray):
+        chex.assert_shape(disg_weights, self._disg_weights.shape)
+        self._disg_weights = disg_weights
 
     def update_normalization_stats(self, input, output, state: EnsembleState):
         if self.normalize_data:
@@ -237,15 +246,26 @@ class DeterministicEnsemble(object):
         mean, std = self(input=input, state=state, denormalize_output=False)
         al_std = jnp.clip(jnp.sqrt(jnp.square(std).mean(0)), min=1e-3)
         ep_std = mean.std(axis=0)
-        ratio = jnp.square(ep_std / al_std)
-        if self.agg_info_gain == 'sum':
-            info_gain = jnp.log(1 + ratio).sum(axis=-1).reshape(-1, 1)
-        elif self.agg_info_gain == 'mean':
-            info_gain = jnp.log(1 + ratio).mean(axis=-1).reshape(-1, 1)
-        elif self.agg_info_gain == 'max':
-            info_gain = jnp.log(1 + ratio).max(axis=-1).reshape(-1)
+        if self.use_entropy_for_int_rew:
+            ratio = jnp.square(ep_std / al_std) * self._disg_weights
+            if self.agg_info_gain == 'sum':
+                info_gain = jnp.log(1 + ratio).sum(axis=-1).reshape(-1, 1)
+            elif self.agg_info_gain == 'mean':
+                info_gain = jnp.log(1 + ratio).mean(axis=-1).reshape(-1, 1)
+            elif self.agg_info_gain == 'max':
+                info_gain = jnp.log(1 + ratio).max(axis=-1).reshape(-1)
+            else:
+                raise NotImplementedError
         else:
-            raise NotImplementedError
+            ep_std = ep_std * self._disg_weights
+            if self.agg_info_gain == 'sum':
+                info_gain = ep_std.sum(axis=-1).reshape(-1, 1)
+            elif self.agg_info_gain == 'mean':
+                info_gain = ep_std.mean(axis=-1).reshape(-1, 1)
+            elif self.agg_info_gain == 'max':
+                info_gain = ep_std.max(axis=-1).reshape(-1)
+            else:
+                raise NotImplementedError
         if self.normalize_info_gain and update_normalizer:
             # stop gradients wrt the info gain for normalization
             new_info_gain_normalizer_state = \
@@ -342,6 +362,7 @@ def main():
         plt.plot(test_xs.reshape(-1), test_ys[:, j], label='True', color='green')
         by_label = dict(zip(labels, handles))
         plt.legend(by_label.values(), by_label.keys())
+        # plt.savefig(f'bnn_{j}.pdf')
         plt.show()
 
 
